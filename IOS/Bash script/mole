@@ -1,0 +1,274 @@
+#!/bin/bash
+# xmokra01 Oliver Mokras
+# 14.3.2023
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+
+DATE=$(date +"%Y-%m-%d %H:%M:%S")
+
+# Default values
+directory=$(pwd)
+groups=""
+mode="last"
+list=false
+
+# Editors
+if [ -z "$EDITOR" ]; then
+    if [ -z "$VISUAL" ]; then
+        EDITOR="vi"
+    else
+        EDITOR="$VISUAL"
+    fi
+fi
+
+# Check if $MOLE_RC is set
+if [[ -z "$MOLE_RC" ]]; then
+  echo "Error: MOLE_RC is not set."
+  exit 1
+fi
+
+# If file doesnt exist, create it including path
+if [[ ! -f "$MOLE_RC" ]]; then
+  mkdir -p "$(dirname "$MOLE_RC")"
+  touch "$MOLE_RC"
+fi
+
+# Function for secret-log option
+secret_log() {
+    local directory=""
+    # Parse arguments for secret-log option
+    shift
+    while [[ $# -gt 0 ]]
+    do
+        arg="$1"
+
+        case $arg in
+            -a)
+            after_date="$2"
+            shift
+            shift
+            ;;
+            -b)
+            before_date="$2"
+            shift
+            shift
+            ;;
+            *)
+            if [[ -n $1 && $1 != -* ]]; then
+                if [[ -d $1 ]]; then
+                    directory="$directory,$1"
+                fi
+            else
+                echo "Error: $1 is not a valid argument"
+                exit 1
+            fi
+            shift
+            ;;
+        esac
+    done
+
+    directory=${directory#,}
+
+    # Date filter 1
+    if [[ -n "$before_date" ]]; then
+        logs=$(awk -F';' -v d="$before_date" '$1 <= d' "$MOLE_RC")
+    else
+        logs=$(cat "$MOLE_RC")
+    fi
+    # Date filter 2
+    if [[ -n "$after_date" ]]; then
+        logs=$(awk -F';' -v d="$after_date 23:59:59" '$1 >= d' <<< "$logs")
+    fi
+    # Directory filter
+    if [[ -n "$directory" ]]; then
+        logs=$(grep -E "$(echo "$directory" | tr ',' '|')" <<< "$logs" | grep -v "$directory[/].*[/]")
+    fi
+
+    LOG_DIR="$HOME/.mole"
+    LOG_FILE="log_"$USER"_$(date +%Y-%m-%d_%H-%M-%S)"
+    mkdir -p "$LOG_DIR"
+
+    # Extract unique filepaths and sort them
+    filepaths=$(echo "$logs" | awk -F ';' '{print $2}' | sort -u)
+
+    # Loop through filepaths and extract datetimes
+    for filepath in $filepaths; do
+        datetimes=$(echo "$logs" | awk -F ';' -v fp=" $filepath " '$2 == fp {gsub(" ", "_",$1); gsub(":", "-", $1); print $1}' | sort | sed 's/_$//')
+        echo -n "$filepath;" >> "$LOG_DIR/$LOG_FILE"
+        echo "$datetimes" | LC_ALL=C tr -dc '[:print:]\n' | paste -sd ";" >> "$LOG_DIR/$LOG_FILE"
+    done | sort -t ';' -k1
+    bzip2 "$LOG_DIR/$LOG_FILE"
+}
+# Help function
+help(){
+    echo "Usage: mole [-g GROUP] FILE"
+    echo "       mole [-m] [FILTERS] [DIRECTORY]"
+    echo "       mole list [FILTERS] [DIRECTORY]"
+    echo "FILTERS: [-g GROUP1[,GROUP2[,...]]]"
+    echo "         -a DATE"
+    echo "         -b DATE"
+    exit
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]
+do
+    key="$1"
+
+    case $key in
+        -h) help
+        ;;
+        -g)
+        groups="$groups,$2"
+        shift
+        shift
+        ;;
+        -m)
+        mode="most"
+        shift
+        ;;
+        -a)
+        after_date="$2"
+        shift
+        shift
+        ;;
+        -b)
+        before_date="$2"
+        shift
+        shift
+        ;;
+        *)
+        if [[ -n $1 && $1 != -* ]]; then
+            if [[ -d $1 ]]; then
+                directory="$1"
+            elif [[ $1 == "list" ]]; then
+                list=true
+            elif [[ $1 == "secret-log" ]]; then
+                secret_log "$@"
+                exit
+            else
+                file="$1"
+            fi
+        fi
+        shift
+        ;;
+    esac
+done
+groups=${groups#,}
+groups="$groups"
+
+# Check if directory exists
+if [[ ! -d $directory ]]; then
+    echo "Error: $directory does not exist"
+    exit 1
+fi
+
+# Select file
+if [[ -n $file ]]; then
+    selected_file="$file"
+else
+    group_filter="$groups"
+    # Date filter 1
+    if [[ -n "$before_date" ]]; then
+        records=$(awk -F';' -v d="$before_date" '$1 <= d' "$MOLE_RC")
+    else
+        records=$(cat "$MOLE_RC")
+    fi
+    # Date filter 2
+    if [[ -n "$after_date" ]]; then
+        records=$(awk -F';' -v d="$after_date 23:59:59" '$1 >= d' <<< "$records")
+    fi
+    # Group filter
+    if [[ -n "$group_filter" ]]; then
+        recordsV2=$(grep -E "\b($(echo "$group_filter" | tr ',' '|'))\b" <<< "$records" | awk -F';' '$3 ~ /'"$(echo "$group_filter" | tr ',' '|')"'/ {print $0}')
+    else
+        recordsV2="$records"
+    fi
+
+    # Directory filter (always executed)
+    if [[ -n "$directory" ]]; then
+        recordsV3=$(grep "$directory" <<< "$recordsV2" | grep -v "$directory[/].*[/]")
+    fi
+
+    # If list option was selected - list all filtered records
+    if [[ $list == true ]]; then
+        recordsV3=$(echo "$recordsV3" | sort -f -t ';' -k2 | awk -F';' '!seen[$2]++')
+        maxlen=0
+        while read -r line; do
+            filename=$(echo "$line" | awk -F';' '{print $2}' | awk -F'/' '{print $NF}' | sed 's/ *$//')
+            if [ ${#filename} -gt $maxlen ]; then
+                maxlen=${#filename}
+            fi
+        done <<< "$recordsV3"
+        ((maxlen+=1)) # just to make it perfectly aligned
+
+        # Cycle through the lines agian and print filenames and groups
+        while read -r line; do
+
+            dirfile=$(echo "$line" | awk -F';' '{print $2}')
+            file=$(echo "$line" | awk -F';' '{print $2}' | awk -F'/' '{print $NF}' | sed 's/ *$//')
+            group=$(echo "$recordsV2" | awk -v dirfile="$dirfile" -F';' '$2 == dirfile {if ($3 != " ") print $3; else print ""}' | sort -u | tr -d '\n' | tr ' ' ',' | sed 's/,$//')
+            group=$(echo "$group" | sed 's/^\s*$/-/g')
+
+            # Output the results
+            if [[ ! -z $file ]];then
+                printf "%-${maxlen}s %s\n" "$file:" "$group"
+            fi
+        done <<< "$recordsV3"
+        exit 0
+    fi
+
+    # Lastly select a file from all possible records
+    if [[ $mode == "most" ]]; then
+        selected_file=$(grep "$directory" <<< "$recordsV3" | sort -t';' -k4nr | head -n1 | awk -F';' '{print $2}' | cut -d' ' -f2)
+    else
+        selected_file=$(grep "$directory" <<< "$recordsV3" | sort -r -k1 | head -n1 | awk -F';' '{print $2}' | cut -d' ' -f2)
+    fi
+
+    # Checks if it found any file
+    if [[ -z $selected_file ]]; then
+        echo "Error: No matching file found in $directory"
+        exit 1
+    fi
+    # Checks if file exists
+    if [ ! -e "$selected_file" ]; then
+        echo "$selected_file does not exist."
+        exit 1
+    fi
+fi
+
+# Open selected file or create new one
+if [ ! -f "$selected_file" ]; then
+    mkdir -p "$(dirname "$selected_file")"
+    touch "$selected_file"
+fi
+$EDITOR "$selected_file"
+
+
+# Counting how many times was file opened/edited
+PATHH=$(realpath "$selected_file")
+COUNT=$(grep -c "$PATHH ;" "$MOLE_RC")
+COUNT=$((COUNT+1))
+
+# # Finding the last time file was opened/edited
+# LAST_DATE=$(grep "$PATHH ;" "$MOLE_RC" | awk -F';' '{print $1}' | sort | tail -n 1)
+
+# # Finding the groups of the last time file was opened/edited
+# if [[ -n "$LAST_DATE" ]]; then
+#     old_groups=$(grep "$LAST_DATE" "$MOLE_RC" | awk -F';' '{print $3}' | tr -d ' ' | tr ',' '\n' | sort | uniq | tr '\n' ',' | sed 's/,\s*$//')
+# fi
+
+# Adding new groups to the old ones
+# Convert comma-separated strings to arrays
+# IFS=',' read -ra old_groups_arr <<< "$old_groups"
+IFS=',' read -ra groups_arr <<< "$groups"
+
+# Merge the arrays and remove duplicates
+merged_groups_arr=($(echo "${groups_arr[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+
+# Convert the merged array back to a comma-separated string
+groups=$(IFS=','; echo "${merged_groups_arr[*]}")
+
+# Write down evrything to the log file
+echo "$DATE ; $PATHH ;$groups ; $COUNT" >> "$MOLE_RC"
